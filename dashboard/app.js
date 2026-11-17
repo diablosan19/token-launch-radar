@@ -28,12 +28,17 @@
   }
   // The model in one function: the page recomputes a row from the snapshot figures and checks the
   // number board.json carries, so the page's code and the board's data are visibly the same arithmetic.
+  // radar-2: the multiple is per row — the median market-cap/TVL of the tokenized protocols in the
+  // row's own category, shrunk toward the market-wide median by comp depth (data.js carries both the
+  // row's multiple and the comp table it came from). A row without its own multiple (old data) falls
+  // back to the model's flat constant.
   function impliedOf(row, model) {
     var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
     var growthMult = 1 + (growth / 100) * model.growth_weight;
     var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
     var maturity = model.maturity_floor + (Math.min(Math.max(age, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-    return Math.max(1, Math.round(row.tvl_usd * model.base_multiple * growthMult * maturity));
+    var multiple = row.base_multiple === null || row.base_multiple === undefined ? model.base_multiple : row.base_multiple;
+    return Math.max(1, Math.round(row.tvl_usd * multiple * growthMult * maturity));
   }
 
   function el(tag, attrs) {
@@ -93,18 +98,34 @@
     if (s.length < 20) s = s + " Hold the position and check the protocol's own page.";
     return s;
   }
+  // The rationale step that opens a radar-2 plan: the same sentence lib/model.ts writes into
+  // board.json, rebuilt here from the row's own fields (multiple, comp count, confidence, implied).
+  function rationaleStep(p) {
+    var cat = p.category || 'its category';
+    var move = p.change_7d === null || p.change_7d === undefined ? 'a flat 7d TVL record' : 'a ' + (p.change_7d >= 0 ? 'rising' : 'falling') + ' 7d TVL (' + (p.change_7d >= 0 ? '+' : '') + (Math.round(p.change_7d * 10) / 10) + '%)';
+    var comps = !p.comp_count ? 'no tokenized comps in its category, so the market-wide median multiple applies' : 'the ' + cat + ' median of ' + p.comp_count + ' tokenized comp' + (p.comp_count === 1 ? '' : 's') + ', shrunk toward the market-wide median';
+    return {
+      text: 'Why farm ' + p.name + ' first: its TVL priced at ' + p.base_multiple + 'x from ' + comps + ' implies about $' + Math.round(p.implied_value_usd).toLocaleString('en-US') + ', with ' + move + '; confidence ' + p.confidence + '/100, so size the position to that confidence, not to the headline number.',
+      cost: 'nothing to read the evidence before you deposit',
+      time: '2 minutes'
+    };
+  }
   function farmSteps(p) {
     var chain = chainOf(p);
     var capital = capitalFor(p);
     var hold = holdDaysFor(p.age_days);
-    return [
+    var plan = [
       { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.', cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
       { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and about $' + (capital >= 150 ? 8 : 4) + ' of gas', time: '15 minutes to set up' },
       { text: 'Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.', cost: 'about $2 of gas a week', time: '10 minutes a week' },
       { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot.', cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
       { text: "Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes.", cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
       { text: 'Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.', cost: 'nothing but the log', time: '5 minutes' }
-    ].map(stepText);
+    ];
+    // radar-2 rows carry their scoring evidence; only those get the rationale step, exactly as
+    // board.json carries it, so the page's plan and the board's plan stay the same seven steps.
+    if (p.base_multiple !== null && p.base_multiple !== undefined && p.confidence) plan.unshift(rationaleStep(p));
+    return plan.map(stepText);
   }
 
   function readHash() {
@@ -283,13 +304,20 @@
 
   function modelPanel() {
     var m = DATA.model;
+    // radar-2's comp table: every category that has tokenized comps, deepest first, with the raw
+    // median it trades at and the shrunk multiple rows of that category were actually priced with.
+    var compLines = (DATA.multiples || []).map(function (c) {
+      return c.category + ': median ' + c.median + 'x from ' + c.count + ' comp' + (c.count === 1 ? '' : 's') + ' -> priced at ' + c.effective + 'x';
+    });
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x ' + m.base_multiple + ' x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )'
+        'multiple(category) = shrink( median mcap/TVL of the category\'s tokenized comps toward the market-wide median ' + DATA.global_multiple + 'x, weight n/(n+' + m.comp_shrink_k + ') ), clamped to [' + m.multiple_floor + ', ' + m.multiple_cap + '] and to [global/8, global x 3]\n' +
+        'implied = round( tvl_usd x multiple(category) x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )'
       ),
-      el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. The early radar is every pre-token protocol below the watchlist floor, by TVL, and the live-token protocols are set aside with their market caps shown.' })
+      el('p', { class: 'sub', text: 'The snapshot prices its own watchlist: ' + DATA.comp_count + ' tokenized protocols are the comparable set, and a category with few comps mostly borrows the market-wide median instead of trusting its own. Each row also carries a confidence score (comp depth, TVL scale, known age, calm momentum, with a hard ceiling when a category has two comps or fewer), and its farm plan opens with the rationale. TVL and seven-day growth come from the snapshot; age is the time since the protocol was first listed, and an unlisted age uses ' + m.unknown_age_days + ' days. The early radar is every pre-token protocol below the watchlist floor, by TVL, and the live-token protocols are set aside with their market caps shown.' }),
+      compLines.length ? el('div', { class: 'formula' }, compLines.join('\n')) : null
     );
   }
 
@@ -319,6 +347,9 @@
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
         el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
+        el('div', null, el('span', { text: 'Category multiple' }), el('b', { class: 'num', text: (row.base_multiple === null || row.base_multiple === undefined ? 'n/a' : String(row.base_multiple) + 'x') })),
+        el('div', null, el('span', { text: 'Tokenized comps behind it' }), el('b', { class: 'num', text: String(row.comp_count || 0) })),
+        el('div', null, el('span', { text: 'Confidence' }), el('b', { class: 'num', text: (row.confidence ? String(row.confidence) + ' / 100' : 'n/a') })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
       el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(impliedOf(row, DATA.model)) + (impliedOf(row, DATA.model) === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })

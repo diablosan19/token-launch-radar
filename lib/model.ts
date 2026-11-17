@@ -6,16 +6,34 @@
 // snapshot's live-token protocols are kept apart and shown as the market's own values, never mixed into
 // the ranked board.
 //
-// Implied value follows only from the snapshot's own figures:
+// Implied value follows only from the snapshot's own figures, but radar-2 prices a tokenless
+// protocol the way an analyst would: against the protocols in its own category that already have a
+// token. The snapshot's tokenized protocols are a built-in comparable set ("comps"): each one trades
+// at some market-cap / TVL ratio, and the MEDIAN of that ratio inside a category is what the market
+// currently pays for a dollar of TVL in that kind of protocol.
 //
-//   base       = tvl_usd x BASE_MULTIPLE
-//   growth     = clamp(change_7d, -60, 120) per cent
-//   growthMult = 1 + (growth / 100) x GROWTH_WEIGHT
-//   maturity   = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
-//   implied    = max(1, round(base x growthMult x maturity))
+//   compRatio(p)  = mcap_usd / tvl_usd          (tokenized protocols only, CEX excluded)
+//   catMedian     = median of compRatio over the protocol's own category
+//   globalMedian  = median of compRatio over every category (0.246 on the sealed snapshot)
+//   multiple      = shrink(catMedian toward globalMedian, weight = n / (n + COMP_SHRINK_K)),
+//                   clamped to [MULTIPLE_FLOOR, MULTIPLE_CAP] and to [globalMedian/8, globalMedian
+//                   x 3]; a category with no comps at all falls back to globalMedian, and a snapshot
+//                   with no comps falls back to BASE_MULTIPLE. Shrinkage is the honesty mechanism:
+//                   one lucky comp (a category whose single token trades at 400x TVL) must not
+//                   reprice a whole category — with k=6 it keeps only 1/7 of its own median.
+//   base          = tvl_usd x multiple
+//   growth        = clamp(change_7d, -60, 120) per cent
+//   growthMult    = 1 + (growth / 100) x GROWTH_WEIGHT   (7d TVL momentum, damped by the weight)
+//   maturity      = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
+//   implied       = max(1, round(base x growthMult x maturity))
 //
-// The constants are the house model's, stated in the dashboard and changeable in the model sandbox. No
-// protocol name is ever special-cased: the same function scores every row.
+// Every row also carries a confidence score (0-100, see confidenceScore): deep comp sets, large TVL,
+// a known listing age and calm momentum make an estimate trustworthy; a one-comp category with a
+// violent 7d swing does not. The first farm step of every row states the rationale in plain words:
+// the multiple used, how many comps it came from, and the confidence it deserves.
+//
+// The constants are stated in the dashboard and changeable in the model sandbox. No protocol name is
+// ever special-cased: the same function scores every row.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -42,6 +60,7 @@ export interface Snapshot {
 
 /** The model's constants, as the dashboard states them and the sandbox may change them. */
 export interface ModelConstants {
+  /** Fallback multiple, used only when the snapshot holds no tokenized comp at all. */
   base_multiple: number;
   growth_weight: number;
   growth_floor: number;
@@ -50,6 +69,11 @@ export interface ModelConstants {
   maturity_range: number;
   maturity_days: number;
   unknown_age_days: number;
+  /** Shrinkage strength: a category with n comps trusts its own median n / (n + k) of the way. */
+  comp_shrink_k: number;
+  /** No category multiple, however rich its comps trade, is allowed outside this band. */
+  multiple_floor: number;
+  multiple_cap: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -61,10 +85,34 @@ export const MODEL: ModelConstants = {
   maturity_range: 0.4,
   maturity_days: 1095,
   unknown_age_days: 365,
+  // k=6, not a gentler 3: the first radar-2 run let Risk Curators' single comp (2.975x) pull its
+  // twelve watchlist rows to the top of the board at 0.93x. With k=6 a one-comp category keeps only
+  // 1/7 of its own median and borrows the rest from the market-wide figure.
+  comp_shrink_k: 6,
+  multiple_floor: 0.03,
+  multiple_cap: 2,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-1';
+export const MODEL_VERSION = 'radar-2';
+
+/** One category's comparable set: how many tokenized comps it has and what they trade at. */
+export interface CategoryMultiple {
+  category: string;
+  /** The category's median mcap/TVL comp ratio, before shrinkage (0 when it has no comps). */
+  median: number;
+  /** How many tokenized protocols in the snapshot carry that category. */
+  count: number;
+  /** The multiple rows of this category are actually priced with: shrunk toward the global median and clamped. */
+  effective: number;
+}
+
+/** The whole comparable set of a snapshot: the global median plus one entry per category. */
+export interface CompStats {
+  global_median: number;
+  comp_count: number;
+  by_category: CategoryMultiple[];
+}
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 160;
@@ -120,6 +168,12 @@ export interface RadarRow {
   implied_value_usd: number;
   growth_multiplier: number;
   maturity_multiplier: number;
+  /** radar-2: the shrunk category multiple this row was priced with. */
+  base_multiple: number;
+  /** radar-2: how many tokenized comps stand behind that multiple. */
+  comp_count: number;
+  /** radar-2: 0-100, how much this row's implied value deserves trust. */
+  confidence: number;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -144,6 +198,12 @@ export interface RadarData {
   board_size: number;
   early_size: number;
   live_size: number;
+  /** radar-2: the market-wide median mcap/TVL multiple every category shrinks toward. */
+  global_multiple: number;
+  /** radar-2: how many tokenized comps the whole snapshot carries. */
+  comp_count: number;
+  /** radar-2: the per-category comp table the dashboard's model panel renders. */
+  multiples: CategoryMultiple[];
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -183,6 +243,123 @@ export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: Mo
   const base = protocol.tvl_usd * model.base_multiple;
   const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
   return { implied, growthPct, growthMult, maturityMult, age };
+}
+
+/** The median of a non-empty list: the middle value, or the mean of the two middle ones. */
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
+}
+
+/**
+ * The comparable set of a snapshot, computed once per board. A comp is a protocol that already has a
+ * token with a real market: mcap and TVL both positive. Exchanges are excluded (their "TVL" is a
+ * custody balance, not a product the market prices the same way), and a versioned pool's parent token
+ * must not double-count, so only the snapshot's own live rows count, exactly as recorded.
+ *
+ * Each category's raw median is then shrunk toward the global median with weight n / (n + k): with
+ * many comps the category speaks for itself; with one comp it mostly borrows the market-wide figure.
+ * The shrunk value is clamped to the model's band so no thin category can produce an absurd price.
+ */
+export function computeComps(snapshot: Snapshot, model: ModelConstants = MODEL): CompStats {
+  const ratiosByCategory = new Map<string, number[]>();
+  const all: number[] = [];
+  for (const p of snapshot.protocols) {
+    if (isPreToken(p) || p.category === 'CEX') continue;
+    if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
+    const ratio = p.mcap_usd / p.tvl_usd;
+    all.push(ratio);
+    const key = p.category ?? 'Other';
+    const list = ratiosByCategory.get(key);
+    if (list === undefined) ratiosByCategory.set(key, [ratio]);
+    else list.push(ratio);
+  }
+  const globalMedian = all.length > 0 ? median(all) : model.base_multiple;
+  // Two clamps, both stated in the dashboard: the model's absolute band, and a band relative to the
+  // market-wide median — no category, however its comps trade, is priced at more than 3x (or less
+  // than 1/8 of) what the whole market pays for a dollar of TVL. The relative band is what stops a
+  // rich-but-thin category from outpricing every deep category on the board.
+  const clampMultiple = (v: number): number =>
+    Math.min(model.multiple_cap, globalMedian * 3, Math.max(model.multiple_floor, globalMedian / 8, v));
+  const byCategory: CategoryMultiple[] = [...ratiosByCategory.entries()]
+    .map(([category, ratios]) => {
+      const med = median(ratios);
+      const w = ratios.length / (ratios.length + model.comp_shrink_k);
+      const shrunk = w * med + (1 - w) * globalMedian;
+      return {
+        category,
+        median: round4(med),
+        count: ratios.length,
+        effective: round4(clampMultiple(shrunk)),
+      };
+    })
+    .sort((a, b) => b.count - a.count || (a.category < b.category ? -1 : 1));
+  return { global_median: round4(globalMedian), comp_count: all.length, by_category: byCategory };
+}
+
+/** The multiple one category is priced with: its shrunk comp median, or the global median when it has no comps. */
+export function categoryMultiple(stats: CompStats, category: string | null, model: ModelConstants = MODEL): CategoryMultiple {
+  const found = stats.by_category.find((c) => c.category === (category ?? 'Other'));
+  if (found !== undefined) return found;
+  return { category: category ?? 'Other', median: 0, count: 0, effective: round4(Math.min(model.multiple_cap, Math.max(model.multiple_floor, stats.global_median))) };
+}
+
+/**
+ * How much to trust one row's implied value, 0-100. Four plain ingredients, each capped so no single
+ * one can carry the score: comp depth (is this category actually priced by the market?), scale (big
+ * TVL is harder to fake than small TVL), a known age (an unlisted protocol's maturity is a guess),
+ * and calm momentum (a protocol whose TVL halved or tripled in a week is mid-event, not steady).
+ */
+export function confidenceScore(p: SnapshotProtocol, compCount: number, age: number | null): number {
+  let score = 25; // having a TVL record at all
+  score += 30 * (compCount / (compCount + 4)); // comp depth: 1 comp ~6, 4 comps 15, 12+ comps ~22+
+  score += 20 * Math.min(1, Math.max(0, Math.log10(Math.max(p.tvl_usd, 1) / 1_000_000) / 3)); // $1M -> 0, $1B -> 20
+  score += age === null ? 3 : 10; // a known listing date beats the unknown-age assumption
+  const swing = p.change_7d === null ? null : Math.abs(p.change_7d);
+  score += swing === null ? 4 : swing <= 20 ? 10 : swing <= 60 ? 5 : 1; // calm weeks price better than violent ones
+  // A hard ceiling by comp depth, on top of the additive score: a multiple drawn from zero or one
+  // tokenized protocol is a guess about a category, however large or calm this protocol is, and the
+  // score must say so. (v1 let a one-comp category's biggest row read 71/100; that is overclaiming.)
+  const ceiling = compCount === 0 ? 45 : compCount === 1 ? 58 : compCount === 2 ? 68 : 97;
+  return Math.max(5, Math.min(ceiling, Math.round(score)));
+}
+
+/** Everything radar-2 knows about one protocol: its implied value and the evidence behind it. */
+export interface Scored {
+  implied: number;
+  growthPct: number;
+  growthMult: number;
+  maturityMult: number;
+  age: number | null;
+  /** The category multiple actually used (after shrinkage and clamping), not the flat constant. */
+  multiple: number;
+  /** How many tokenized comps stand behind that multiple. */
+  compCount: number;
+  confidence: number;
+}
+
+/** One protocol scored by the comparable-multiple model: comp multiple first, then momentum and maturity. */
+export function scoreProtocol(protocol: SnapshotProtocol, asOf: string, model: ModelConstants, stats: CompStats): Scored {
+  const comp = categoryMultiple(stats, protocol.category, model);
+  const age = ageDays(asOf, protocol.listed_at);
+  const rawGrowth = finite(protocol.change_7d, 0);
+  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
+  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
+  const ageForModel = age ?? model.unknown_age_days;
+  const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
+  const base = protocol.tvl_usd * comp.effective;
+  const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
+  return {
+    implied,
+    growthPct,
+    growthMult,
+    maturityMult,
+    age,
+    multiple: comp.effective,
+    compCount: comp.count,
+    confidence: confidenceScore(protocol, comp.count, age),
+  };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -229,9 +406,11 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     .slice(0, EARLY_ROWS);
   for (const p of early) chosen.set(p.slug, p);
 
+  // radar-2: one comparable set for the whole snapshot, computed once; every row is priced from it.
+  const stats = computeComps(snapshot, model);
   const scored = [...chosen.values()].map((p) => {
-    const { implied, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model);
-    return { p, implied, growthPct, growthMult, maturityMult, age };
+    const s = scoreProtocol(p, snapshot.as_of, model, stats);
+    return { p, ...s };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
@@ -250,13 +429,20 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     age_days: s.age,
     implied_value_usd: s.implied,
     model: {
-      base_multiple: model.base_multiple,
+      // The multiple recorded per row is the row's own category multiple, so the board's arithmetic
+      // can be re-checked row by row: tvl x this multiple x growth x maturity = the implied value.
+      base_multiple: s.multiple,
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
       age_days: s.age,
     },
-    farm_steps: farmSteps(s.p, s.age).map(stepText),
+    farm_steps: farmSteps(s.p, s.age, {
+      implied: s.implied,
+      multiple: s.multiple,
+      compCount: s.compCount,
+      confidence: s.confidence,
+    }).map(stepText),
   }));
 }
 
@@ -308,16 +494,43 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
   return `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`;
 }
 
+/** The scoring context a farm plan's rationale step quotes: the row's own numbers, nothing invented. */
+export interface FarmContext {
+  implied: number;
+  multiple: number;
+  compCount: number;
+  confidence: number;
+}
+
 /**
- * A protocol's farm plan: six steps, each an action with a cost and a time. The plan is derived from
- * the protocol's own record (category, chains, TVL, age), never from a hand-written list of names.
+ * The rationale step that opens a radar-2 farm plan: why this protocol ranks where it does, in one
+ * sentence a farmer can audit. It names the category multiple, the number of tokenized comps behind
+ * it, the momentum sign and the confidence score, so a thin-evidence row reads as thin on the page
+ * instead of hiding behind a big implied number.
  */
-export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
+export function rationaleStep(p: SnapshotProtocol, ctx: FarmContext): FarmStep {
+  const cat = p.category ?? 'its category';
+  const move = p.change_7d === null ? 'a flat 7d TVL record' : `a ${p.change_7d >= 0 ? 'rising' : 'falling'} 7d TVL (${p.change_7d >= 0 ? '+' : ''}${Math.round(p.change_7d * 10) / 10}%)`;
+  const comps = ctx.compCount === 0 ? 'no tokenized comps in its category, so the market-wide median multiple applies' : `the ${cat} median of ${ctx.compCount} tokenized comp${ctx.compCount === 1 ? '' : 's'}, shrunk toward the market-wide median`;
+  return {
+    text: `Why farm ${p.name} first: its TVL priced at ${ctx.multiple}x from ${comps} implies about $${Math.round(ctx.implied).toLocaleString('en-US')}, with ${move}; confidence ${ctx.confidence}/100, so size the position to that confidence, not to the headline number.`,
+    cost: 'nothing to read the evidence before you deposit',
+    time: '2 minutes',
+  };
+}
+
+/**
+ * A protocol's farm plan: seven steps in radar-2 (a rationale, then six actions), each an action
+ * with a cost and a time. The plan is derived from the protocol's own record (category, chains, TVL,
+ * age) and its scoring context, never from a hand-written list of names. Without a context (a caller
+ * scoring with the old flat model) the plan is the original six steps.
+ */
+export function farmSteps(p: SnapshotProtocol, age: number | null, ctx?: FarmContext): FarmStep[] {
   const chain = chainOf(p);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
   const action = actionFor(p, capital, chain);
-  return [
+  const plan: FarmStep[] = [
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`,
       cost: 'under $3 of gas for the first transaction',
@@ -349,6 +562,8 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: '5 minutes',
     },
   ];
+  // radar-2 opens the plan with its rationale; a context-free caller keeps the original six steps.
+  return ctx === undefined ? plan : [rationaleStep(p, ctx), ...plan];
 }
 
 /** The live-token protocols, by market cap, for the dashboard's Live token view. */
@@ -369,7 +584,7 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
 }
 
 /** A board row's compact form for data.js, with the farm plan generated in the page. */
-export function radarRow(row: BoardRow): RadarRow {
+export function radarRow(row: BoardRow, scored?: Scored): RadarRow {
   return {
     rank: row.rank,
     slug: row.slug,
@@ -384,6 +599,11 @@ export function radarRow(row: BoardRow): RadarRow {
     implied_value_usd: row.implied_value_usd,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
+    // The board row already records its own multiple; comp depth and confidence ride along when the
+    // caller scored the protocol (buildRadar always does), else they read as the neutral defaults.
+    base_multiple: row.model.base_multiple,
+    comp_count: scored?.compCount ?? 0,
+    confidence: scored?.confidence ?? 0,
   };
 }
 
@@ -392,6 +612,14 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  // Re-score each board row against the same comparable set so data.js can show the evidence
+  // (comp depth, confidence, the category table) behind every number on the board.
+  const stats = computeComps(snapshot, model);
+  const index = bySlug(snapshot.protocols);
+  const rows = board.map((row) => {
+    const p = index.get(row.slug);
+    return radarRow(row, p === undefined ? undefined : scoreProtocol(p, snapshot.as_of, model, stats));
+  });
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -402,7 +630,10 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     board_size: board.length,
     early_size: early,
     live_size: live.length,
-    rows: board.map(radarRow),
+    global_multiple: stats.global_median,
+    comp_count: stats.comp_count,
+    multiples: stats.by_category,
+    rows,
     live,
   };
   return { board, radar };

@@ -5,6 +5,14 @@
 // copies this repository's dashboard/ and screenshots/ to /output. Last, it writes /output/dossier.json,
 // the summary the judge reads, with the vendored make.fun library.
 //
+// radar-2 scoring (lib/model.ts has the full derivation): each pre-token protocol is priced from the
+// comparable set inside the snapshot itself — the median market-cap/TVL ratio of the tokenized
+// protocols in its own category, shrunk toward the market-wide median by comp depth and clamped to a
+// sane band — then adjusted by damped 7d TVL momentum and by maturity. Every row also carries a
+// confidence score, and its first farm step states the rationale. Two audit helpers ride along:
+//   node main.ts --explain <slug>   print one protocol's full derivation and exit
+// and the normal run prints the comparable set it used, so the board can be re-derived by hand.
+//
 // The dashboard is a static page, no framework and no network: dashboard/index.html, dashboard/app.css
 // and dashboard/app.js read /output/data.js, which this program writes from the same board. A starting
 // point, not a winner: it covers the watchlist, states the model and gives every protocol a farm plan.
@@ -16,7 +24,7 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import { boardIssue, buildRadar, categoryMultiple, computeComps, dataScript, MODEL, parseSnapshot, scoreProtocol } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -43,6 +51,29 @@ if (!existsSync(inputFile)) {
 const out = arg('output', process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
 
 const snapshot = parseSnapshot(readFileSync(inputFile, 'utf8'));
+
+// --explain <slug>: print one protocol's full radar-2 derivation (the multiple it was priced with,
+// the comps behind it, every multiplier and the confidence) and exit before writing anything. This
+// is the audit path: any number on the board can be traced to the snapshot's own figures with it.
+const explainSlug = arg('explain', '');
+if (explainSlug !== '') {
+  const p = snapshot.protocols.find((x) => x.slug === explainSlug);
+  if (p === undefined) {
+    process.stderr.write(`token radar: no protocol with slug ${explainSlug} in ${inputFile}\n`);
+    process.exit(2);
+  }
+  const stats = computeComps(snapshot);
+  const s = scoreProtocol(p, snapshot.as_of, MODEL, stats);
+  const comp = categoryMultiple(stats, p.category, MODEL);
+  process.stdout.write(
+    `${p.name} (${p.slug}) — ${p.category ?? 'Other'}\n` +
+      `  tvl $${p.tvl_usd.toLocaleString('en-US')} x category multiple ${s.multiple} (category median ${comp.median}x from ${s.compCount} tokenized comps, shrunk toward the global median ${stats.global_median}x)\n` +
+      `  x growth ${s.growthMult.toFixed(4)} (7d ${s.growthPct}%) x maturity ${s.maturityMult.toFixed(4)} (age ${s.age === null ? 'unknown' : `${s.age} days`})\n` +
+      `  = implied $${s.implied.toLocaleString('en-US')}, confidence ${s.confidence}/100\n`,
+  );
+  process.exit(0);
+}
+
 const { board, radar } = buildRadar(snapshot);
 const issue = boardIssue(board, snapshot);
 if (issue !== null) {
@@ -87,5 +118,8 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEX
 
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
-    `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
+    `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n` +
+    // The comparable set this board was priced from, deepest categories first: the audit trail in one line.
+    `token radar: comps: ${radar.comp_count} tokenized, global median multiple ${radar.global_multiple}x; ` +
+    `${radar.multiples.slice(0, 6).map((c) => `${c.category} ${c.effective}x (n=${c.count})`).join('; ')}\n`,
 );
