@@ -35,6 +35,10 @@
 // The constants are stated in the dashboard and changeable in the model sandbox. No protocol name is
 // ever special-cased: the same function scores every row.
 
+import { buildCompTables, summariseRatios, type CategoryCompTable } from './comps.ts';
+
+export type { CategoryCompTable } from './comps.ts';
+
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
   slug: string;
@@ -204,6 +208,8 @@ export interface RadarData {
   comp_count: number;
   /** radar-2: the per-category comp table the dashboard's model panel renders. */
   multiples: CategoryMultiple[];
+  /** The fuller comp analysis from lib/comps.ts: quartiles, trimmed medians, outliers and quality. */
+  comp_tables: CategoryCompTable[];
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -245,13 +251,6 @@ export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: Mo
   return { implied, growthPct, growthMult, maturityMult, age };
 }
 
-/** The median of a non-empty list: the middle value, or the mean of the two middle ones. */
-function median(values: number[]): number {
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
-}
-
 /**
  * The comparable set of a snapshot, computed once per board. A comp is a protocol that already has a
  * token with a real market: mcap and TVL both positive. Exchanges are excluded (their "TVL" is a
@@ -275,7 +274,10 @@ export function computeComps(snapshot: Snapshot, model: ModelConstants = MODEL):
     if (list === undefined) ratiosByCategory.set(key, [ratio]);
     else list.push(ratio);
   }
-  const globalMedian = all.length > 0 ? median(all) : model.base_multiple;
+  // The medians come from lib/comps.ts: the same summariser that builds the dashboard's comp table
+  // (quartiles, IQR trimming, quality grades) supplies the middle value the shrinkage starts from,
+  // so the number a reader sees in the comp table is the number the scoring path actually used.
+  const globalMedian = all.length > 0 ? summariseRatios(all).median : model.base_multiple;
   // Two clamps, both stated in the dashboard: the model's absolute band, and a band relative to the
   // market-wide median — no category, however its comps trade, is priced at more than 3x (or less
   // than 1/8 of) what the whole market pays for a dollar of TVL. The relative band is what stops a
@@ -284,7 +286,7 @@ export function computeComps(snapshot: Snapshot, model: ModelConstants = MODEL):
     Math.min(model.multiple_cap, globalMedian * 3, Math.max(model.multiple_floor, globalMedian / 8, v));
   const byCategory: CategoryMultiple[] = [...ratiosByCategory.entries()]
     .map(([category, ratios]) => {
-      const med = median(ratios);
+      const med = summariseRatios(ratios).median;
       const w = ratios.length / (ratios.length + model.comp_shrink_k);
       const shrunk = w * med + (1 - w) * globalMedian;
       return {
@@ -633,6 +635,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     global_multiple: stats.global_median,
     comp_count: stats.comp_count,
     multiples: stats.by_category,
+    comp_tables: buildCompTables(snapshot),
     rows,
     live,
   };

@@ -121,5 +121,20 @@ process.stdout.write(
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n` +
     // The comparable set this board was priced from, deepest categories first: the audit trail in one line.
     `token radar: comps: ${radar.comp_count} tokenized, global median multiple ${radar.global_multiple}x; ` +
-    `${radar.multiples.slice(0, 6).map((c) => `${c.category} ${c.effective}x (n=${c.count})`).join('; ')}\n`,
+    `${radar.multiples.slice(0, 6).map((c) => `${c.category} ${c.effective}x (n=${c.count})`).join('; ')}\n` +
+    // The fuller comp table from lib/comps.ts — the same rows data.js carries as radar.comp_tables
+    // for the dashboard's comp panel: quartiles show the spread behind each median, the trimmed
+    // median shows what one wild comp would otherwise hide, and the quality grade says how much
+    // evidence each category really has.
+    `token radar: comp table (category: median [q1..q3], trimmed median, outliers set aside, quality):\n` +
+    `${radar.comp_tables
+      .filter((t) => t.usable > 0)
+      .map(
+        (t) =>
+          `  ${t.category}: ${t.median_multiple}x [${t.q1_multiple}x..${t.q3_multiple}x], trimmed ${t.trimmed_median_multiple}x, ` +
+          `${t.outliers_removed} outlier${t.outliers_removed === 1 ? '' : 's'} of ${t.usable} comps, coverage ${t.coverage_pct}%, ${t.quality}`,
+      )
+      .join('\n')}\n` +
+    `  (${radar.comp_tables.filter((t) => t.usable === 0).length} further categories have tokenised protocols but no usable comp — ` +
+    `missing market caps or TVL — and are priced from the global median instead)\n`,
 );

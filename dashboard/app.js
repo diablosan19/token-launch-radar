@@ -1,6 +1,8 @@
 // Token Radar's plain dashboard. It reads window.RADAR (written beside dashboard/ by main.ts) and
-// renders the ranked board, a filterable table, a per-protocol detail drawer with the model's own
-// inputs and the protocol's farm plan. No network: every byte it shows is in data.js.
+// renders the ranked board, a searchable and sortable table, a per-protocol detail drawer with the
+// model's own inputs and the protocol's farm plan, the model panel, and a comparable-set panel
+// built from the comp analysis in lib/comps.ts (quartiles, trimmed medians, data quality).
+// No network: every byte it shows is in data.js.
 (function () {
   'use strict';
 
@@ -8,6 +10,8 @@
   if (!DATA) return;
   var app = document.getElementById('board');
   var state = { q: '', category: 'all', tab: 'pre-token', sort: 'implied', dir: -1, selected: null };
+
+  // ---------- formatting helpers ----------
 
   var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
   function fmtUsd(n) {
@@ -26,12 +30,17 @@
     if (days >= 365) return (days / 365).toFixed(1) + 'y';
     return Math.max(0, Math.round(days)) + 'd';
   }
+  function fmtMultiple(n) {
+    if (n === null || n === undefined || !isFinite(n)) return 'n/a';
+    return (Math.round(n * 10000) / 10000) + 'x';
+  }
+
   // The model in one function: the page recomputes a row from the snapshot figures and checks the
-  // number board.json carries, so the page's code and the board's data are visibly the same arithmetic.
-  // radar-2: the multiple is per row — the median market-cap/TVL of the tokenized protocols in the
-  // row's own category, shrunk toward the market-wide median by comp depth (data.js carries both the
-  // row's multiple and the comp table it came from). A row without its own multiple (old data) falls
-  // back to the model's flat constant.
+  // number board.json carries, so the page's code and the board's data are visibly the same
+  // arithmetic. The multiple is per row — the median market-cap/TVL of the tokenized protocols in
+  // the row's own category, shrunk toward the market-wide median by comp depth (data.js carries
+  // both the row's multiple and the comp table it came from). A row without its own multiple (old
+  // data) falls back to the model's flat constant.
   function impliedOf(row, model) {
     var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
     var growthMult = 1 + (growth / 100) * model.growth_weight;
@@ -41,6 +50,7 @@
     return Math.max(1, Math.round(row.tvl_usd * multiple * growthMult * maturity));
   }
 
+  // A tiny element builder: el('td', { class: 'num', text: 'x' }, child, 'text', ...).
   function el(tag, attrs) {
     var node = document.createElement(tag);
     if (attrs) {
@@ -62,7 +72,8 @@
     return node;
   }
 
-  // The farm plan is the same derivation main.ts writes to board.json: category, chains, TVL and age
+  // ---------- the farm plan, re-derived in the page ----------
+  // The plan is the same derivation main.ts writes to board.json: category, chains, TVL and age
   // decide the action, the capital, the hold and every cost and time. No name is special-cased.
   function chainOf(p) { return p.chains && p.chains.length > 0 ? p.chains[0] : 'its main chain'; }
   function capitalFor(p) {
@@ -98,8 +109,8 @@
     if (s.length < 20) s = s + " Hold the position and check the protocol's own page.";
     return s;
   }
-  // The rationale step that opens a radar-2 plan: the same sentence lib/model.ts writes into
-  // board.json, rebuilt here from the row's own fields (multiple, comp count, confidence, implied).
+  // The rationale step that opens a plan: the same sentence lib/model.ts writes into board.json,
+  // rebuilt here from the row's own fields (multiple, comp count, confidence, implied value).
   function rationaleStep(p) {
     var cat = p.category || 'its category';
     var move = p.change_7d === null || p.change_7d === undefined ? 'a flat 7d TVL record' : 'a ' + (p.change_7d >= 0 ? 'rising' : 'falling') + ' 7d TVL (' + (p.change_7d >= 0 ? '+' : '') + (Math.round(p.change_7d * 10) / 10) + '%)';
@@ -122,12 +133,13 @@
       { text: "Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes.", cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
       { text: 'Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.', cost: 'nothing but the log', time: '5 minutes' }
     ];
-    // radar-2 rows carry their scoring evidence; only those get the rationale step, exactly as
-    // board.json carries it, so the page's plan and the board's plan stay the same seven steps.
+    // Rows that carry their scoring evidence get the rationale step, exactly as board.json
+    // carries it, so the page's plan and the board's plan stay the same seven steps.
     if (p.base_multiple !== null && p.base_multiple !== undefined && p.confidence) plan.unshift(rationaleStep(p));
     return plan.map(stepText);
   }
 
+  // ---------- view state in the URL hash ----------
   function readHash() {
     var hash = window.location.hash.replace(/^#/, '');
     if (!hash) return;
@@ -135,40 +147,138 @@
     if (params.get('q')) state.q = params.get('q');
     if (params.get('p')) state.selected = params.get('p');
     if (params.get('category')) state.category = params.get('category');
+    if (params.get('sort')) state.sort = params.get('sort');
+    if (params.get('dir') === '1' || params.get('dir') === '-1') state.dir = Number(params.get('dir'));
+    if (params.get('tab') === 'live') state.tab = 'live';
   }
   function writeHash() {
     var params = new URLSearchParams();
     if (state.q) params.set('q', state.q);
     if (state.category !== 'all') params.set('category', state.category);
+    if (state.sort !== 'implied') params.set('sort', state.sort);
+    if (state.dir !== -1) params.set('dir', String(state.dir));
+    if (state.tab !== 'pre-token') params.set('tab', state.tab);
     if (state.selected) params.set('p', state.selected);
     var next = params.toString();
     if (next) window.history.replaceState(null, '', '#' + next);
     else window.history.replaceState(null, '', window.location.pathname + window.location.search);
   }
 
+  // ---------- filtering, searching and sorting ----------
+
+  // Text search matches the protocol's name and its slug first of all (a farmer who remembers
+  // "steakhouse" or the slug "steakhouse-financial" should land on the same row), then falls
+  // back to the category and chain names so broader terms still find their rows.
+  function matchesSearch(r, q) {
+    if (!q) return true;
+    if (r.name.toLowerCase().indexOf(q) >= 0) return true;
+    if (r.slug.toLowerCase().indexOf(q) >= 0) return true;
+    var hay = [(r.category || ''), (r.chains || []).join(' ')].join(' ').toLowerCase();
+    return hay.indexOf(q) >= 0;
+  }
   function rows() {
     var q = state.q.trim().toLowerCase();
     return DATA.rows.filter(function (r) {
       if (state.category !== 'all' && r.category !== state.category) return false;
-      if (!q) return true;
-      var hay = [r.name, r.slug, r.category, (r.chains || []).join(' ')].join(' ').toLowerCase();
-      return hay.indexOf(q) >= 0;
+      return matchesSearch(r, q);
     });
   }
+  // The sort keys the controls offer. Confidence sorts missing scores last in either direction:
+  // an unscored row is not a zero-confidence row, it is an unknown one.
+  var SORT_KEYS = {
+    implied: function (r) { return r.implied_value_usd; },
+    tvl: function (r) { return r.tvl_usd; },
+    confidence: function (r) { return r.confidence === null || r.confidence === undefined ? -1 : r.confidence; },
+    growth: function (r) { return r.change_7d === null || r.change_7d === undefined ? -Infinity : r.change_7d; },
+    age: function (r) { return r.age_days === null || r.age_days === undefined ? Infinity : r.age_days; },
+    name: function (r) { return r.name.toLowerCase(); }
+  };
   function sortedRows(list) {
-    var key = state.sort;
+    var get = SORT_KEYS[state.sort] || SORT_KEYS.implied;
     return list.slice().sort(function (a, b) {
-      var av, bv;
-      if (key === 'name') { av = a.name.toLowerCase(); bv = b.name.toLowerCase(); }
-      else if (key === 'tvl') { av = a.tvl_usd; bv = b.tvl_usd; }
-      else if (key === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
-      else if (key === 'age') { av = a.age_days === null ? Infinity : a.age_days; bv = b.age_days === null ? Infinity : b.age_days; }
-      else { av = a.implied_value_usd; bv = b.implied_value_usd; }
+      var av = get(a), bv = get(b);
       if (av < bv) return -state.dir;
       if (av > bv) return state.dir;
       return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
     });
   }
+  // A one-line summary of whatever the current filter leaves on screen: how much TVL it holds,
+  // and the average confidence across it — the quickest way to see whether a filter narrowed the
+  // board down to solid rows or to speculative ones.
+  function shownSummary(list) {
+    if (list.length === 0) return '';
+    var tvl = 0, confTotal = 0, confCount = 0;
+    list.forEach(function (r) {
+      tvl += r.tvl_usd || 0;
+      if (r.confidence) { confTotal += r.confidence; confCount += 1; }
+    });
+    var avg = confCount ? Math.round(confTotal / confCount) : null;
+    return list.length + ' rows shown · ' + fmtUsd(tvl) + ' combined TVL' + (avg === null ? '' : ' · average confidence ' + avg + '/100');
+  }
+
+  // ---------- the comparable-set table (lib/comps.ts, carried in data.js) ----------
+
+  // Older data.js files predate comp_tables; rebuild a minimal version from the multiples the
+  // model panel already carried so the panel never renders empty on stale data.
+  function compTables() {
+    if (Array.isArray(DATA.comp_tables) && DATA.comp_tables.length) return DATA.comp_tables;
+    return (DATA.multiples || []).map(function (c) {
+      return {
+        category: c.category, seen: 0, usable: c.count, missing_mcap: 0, unusable_tvl: 0,
+        coverage_pct: 0, median_multiple: c.median, q1_multiple: 0, q3_multiple: 0,
+        iqr_multiple: 0, min_multiple: 0, max_multiple: 0, trimmed_median_multiple: c.median,
+        outliers_removed: 0, quality: c.count === 0 ? 'none' : c.count === 1 ? 'single comp' : c.count < 4 ? 'thin' : 'usable'
+      };
+    });
+  }
+  function compFor(category) {
+    var key = category || 'Other';
+    var found = compTables().filter(function (t) { return t.category === key; });
+    return found.length ? found[0] : null;
+  }
+  function compPanel() {
+    var tables = compTables().filter(function (t) { return t.usable > 0; });
+    var empty = compTables().filter(function (t) { return t.usable === 0; });
+    if (tables.length === 0) return null;
+    var tbody = el('tbody');
+    tables.forEach(function (t) {
+      tbody.appendChild(el('tr', null,
+        el('td', null, el('b', { text: t.category })),
+        el('td', { class: 'num', text: String(t.usable) }),
+        el('td', { class: 'num', text: fmtMultiple(t.median_multiple) }),
+        el('td', { class: 'num', text: fmtMultiple(t.q1_multiple) }),
+        el('td', { class: 'num', text: fmtMultiple(t.q3_multiple) }),
+        el('td', { class: 'num', text: fmtMultiple(t.trimmed_median_multiple) }),
+        el('td', { class: 'num', text: String(t.outliers_removed) }),
+        el('td', { class: 'num', text: t.coverage_pct ? t.coverage_pct + '%' : 'n/a' }),
+        el('td', null, el('span', { class: 'status', text: t.quality }))
+      ));
+    });
+    return el('section', { class: 'panel model' },
+      el('h2', { text: 'The comparable set, category by category' }),
+      el('p', { class: 'sub', text: 'Each row is one category of tokenized protocols and the market-cap/TVL multiples they trade at. The median is what the model shrinks and prices from; the quartiles show the spread behind it, and the trimmed median recomputes the middle after IQR outliers are set aside — when the two medians disagree, one wild comp is doing the talking. Coverage is the share of tokenized protocols in the category whose figures were usable at all, and the quality grade weighs depth and coverage together.' }),
+      el('div', { class: 'table-wrap' },
+        el('table', null,
+          el('caption', { class: 'sub', text: 'Comparable multiples by category, deepest evidence first.' }),
+          el('thead', null, el('tr', null,
+            el('th', { scope: 'col', text: 'Category' }),
+            el('th', { scope: 'col', text: 'Comps' }),
+            el('th', { scope: 'col', text: 'Median' }),
+            el('th', { scope: 'col', text: 'Q1' }),
+            el('th', { scope: 'col', text: 'Q3' }),
+            el('th', { scope: 'col', text: 'Trimmed median' }),
+            el('th', { scope: 'col', text: 'Outliers' }),
+            el('th', { scope: 'col', text: 'Coverage' }),
+            el('th', { scope: 'col', text: 'Quality' })
+          )),
+          tbody
+        )
+      ),
+      empty.length ? el('p', { class: 'sub', text: empty.length + ' more categories (' + empty.map(function (t) { return t.category; }).join(', ') + ') have tokenized protocols but no usable comp — a missing market cap or TVL — so their rows are priced from the market-wide median instead.' }) : null
+    );
+  }
+
+  // ---------- page sections ----------
 
   function header() {
     return el('header', { class: 'top' },
@@ -198,26 +308,46 @@
 
   function controls() {
     var categories = Array.from(new Set(DATA.rows.map(function (r) { return r.category || 'Other'; }))).sort();
-    var search = el('input', { type: 'search', id: 'q', placeholder: 'Search name, category or chain', value: state.q, 'aria-label': 'Search the board' });
+    var search = el('input', { type: 'search', id: 'q', placeholder: 'Search name, slug, category or chain', value: state.q, 'aria-label': 'Search the board' });
     search.addEventListener('input', function () { state.q = search.value; writeHash(); render(); });
     var select = el('select', { id: 'category', 'aria-label': 'Filter by category' },
       el('option', { value: 'all', text: 'All categories' }),
       categories.map(function (c) { return el('option', { value: c, text: c, selected: c === state.category ? 'selected' : null }); })
     );
     select.addEventListener('change', function () { state.category = select.value; writeHash(); render(); });
-    var pre = el('button', { type: 'button', 'aria-pressed': state.tab === 'pre-token' ? 'true' : 'false', text: 'Pre-token', onclick: function () { state.tab = 'pre-token'; render(); } });
-    var live = el('button', { type: 'button', 'aria-pressed': state.tab === 'live' ? 'true' : 'false', text: 'Live token', onclick: function () { state.tab = 'live'; render(); } });
+    // Explicit sort controls beside the clickable column headers: a select for the key and a
+    // button that flips direction, so sorting is discoverable without knowing the headers sort.
+    var sortSelect = el('select', { id: 'sort', 'aria-label': 'Sort the board by' },
+      [
+        ['implied', 'Implied value'],
+        ['tvl', 'TVL'],
+        ['confidence', 'Confidence'],
+        ['growth', '7d growth'],
+        ['age', 'Age'],
+        ['name', 'Name']
+      ].map(function (pair) { return el('option', { value: pair[0], text: pair[1], selected: state.sort === pair[0] ? 'selected' : null }); })
+    );
+    sortSelect.addEventListener('change', function () { state.sort = sortSelect.value; writeHash(); render(); });
+    var dirButton = el('button', {
+      type: 'button', class: 'button', 'aria-label': 'Toggle sort direction',
+      text: state.dir < 0 ? 'Descending' : 'Ascending',
+      onclick: function () { state.dir = -state.dir; writeHash(); render(); }
+    });
+    var pre = el('button', { type: 'button', 'aria-pressed': state.tab === 'pre-token' ? 'true' : 'false', text: 'Pre-token', onclick: function () { state.tab = 'pre-token'; writeHash(); render(); } });
+    var live = el('button', { type: 'button', 'aria-pressed': state.tab === 'live' ? 'true' : 'false', text: 'Live token', onclick: function () { state.tab = 'live'; writeHash(); render(); } });
     return el('div', { class: 'controls' },
       el('div', { class: 'field' }, el('label', { for: 'q', text: 'Search' }), search),
       el('div', { class: 'field' }, el('label', { for: 'category', text: 'Category' }), select),
+      el('div', { class: 'field' }, el('label', { for: 'sort', text: 'Sort by' }), sortSelect),
+      el('div', { class: 'field' }, el('span', { class: 'sub', text: 'Direction' }), dirButton),
       el('div', { class: 'field' }, el('span', { class: 'sub', text: 'Token status' }), el('div', { class: 'tabs' }, pre, live)),
-      el('span', { class: 'count', text: state.tab === 'pre-token' ? rows().length + ' rows shown' : DATA.live.length + ' live-token protocols' })
+      el('span', { class: 'count', text: state.tab === 'pre-token' ? shownSummary(rows()) : DATA.live.length + ' live-token protocols' })
     );
   }
 
   function sortHeader(key, label) {
     return el('th', { scope: 'col' },
-      el('button', { type: 'button', onclick: function () { if (state.sort === key) state.dir = -state.dir; else { state.sort = key; state.dir = -1; } render(); } },
+      el('button', { type: 'button', onclick: function () { if (state.sort === key) state.dir = -state.dir; else { state.sort = key; state.dir = -1; } writeHash(); render(); } },
         label,
         state.sort === key ? el('span', { 'aria-hidden': 'true', text: state.dir < 0 ? ' v' : ' ^' }) : null
       )
@@ -233,7 +363,7 @@
         el('button', { class: 'button primary', type: 'button', text: 'Clear filters', onclick: function () { state.q = ''; state.category = 'all'; writeHash(); render(); } })
       ));
     }
-    var max = list[0].implied_value_usd || 1;
+    var max = Math.max.apply(null, list.map(function (r) { return r.implied_value_usd; })) || 1;
     var tbody = el('tbody');
     list.forEach(function (r) {
       var growth = r.change_7d === null ? 'n/a' : fmtPct(r.change_7d);
@@ -252,6 +382,7 @@
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
         el('td', { class: 'num ' + growthClass, text: growth }),
         el('td', { class: 'num', text: fmtAge(r.age_days) }),
+        el('td', { class: 'num', text: r.confidence ? String(r.confidence) : 'n/a' }),
         el('td', null, el('div', { class: 'implied' },
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
           el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
@@ -270,6 +401,7 @@
             sortHeader('tvl', 'TVL'),
             sortHeader('growth', '7d'),
             sortHeader('age', 'Age'),
+            sortHeader('confidence', 'Confidence'),
             sortHeader('implied', 'Implied value'),
             el('th', { scope: 'col', text: 'Token' })
           )),
@@ -304,8 +436,9 @@
 
   function modelPanel() {
     var m = DATA.model;
-    // radar-2's comp table: every category that has tokenized comps, deepest first, with the raw
-    // median it trades at and the shrunk multiple rows of that category were actually priced with.
+    // The comp table in one line per category: the raw median it trades at and the shrunk
+    // multiple rows of that category were actually priced with. The full spread is in the
+    // comparable-set panel below.
     var compLines = (DATA.multiples || []).map(function (c) {
       return c.category + ': median ' + c.median + 'x from ' + c.count + ' comp' + (c.count === 1 ? '' : 's') + ' -> priced at ' + c.effective + 'x';
     });
@@ -320,6 +453,8 @@
       compLines.length ? el('div', { class: 'formula' }, compLines.join('\n')) : null
     );
   }
+
+  // ---------- the detail drawer ----------
 
   var dialog = el('dialog', { class: 'detail', id: 'detail', 'aria-labelledby': 'detail-title' });
   dialog.addEventListener('close', function () { state.selected = null; writeHash(); });
@@ -339,19 +474,32 @@
       ),
       el('button', { class: 'close', type: 'button', 'aria-label': 'Close details', text: 'Close', onclick: function () { dialog.close(); } })
     ));
+    var comp = compFor(row.category);
+    var equationRows = [
+      ['TVL', fmtUsd(row.tvl_usd)],
+      ['Seven-day growth', fmtPct(row.change_7d)],
+      ['Age with no token', fmtAge(row.age_days)],
+      ['Growth multiplier', String(row.growth_multiplier)],
+      ['Maturity multiplier', String(row.maturity_multiplier)],
+      ['Category multiple', row.base_multiple === null || row.base_multiple === undefined ? 'n/a' : String(row.base_multiple) + 'x'],
+      ['Tokenized comps behind it', String(row.comp_count || 0)],
+      ['Confidence', row.confidence ? String(row.confidence) + ' / 100' : 'n/a'],
+      ['Implied value', fmtUsd(row.implied_value_usd)]
+    ];
+    // When the comp analysis knows this row's category, show the spread behind its multiple
+    // right under the headline number: a multiple drawn from a tight, deep comp set and one
+    // drawn from two wild observations should not read the same way.
+    if (comp && comp.usable > 0) {
+      equationRows.push(['Category comp median', fmtMultiple(comp.median_multiple)]);
+      equationRows.push(['Category comp quartiles', fmtMultiple(comp.q1_multiple) + ' to ' + fmtMultiple(comp.q3_multiple)]);
+      equationRows.push(['Trimmed median (outliers aside)', fmtMultiple(comp.trimmed_median_multiple) + (comp.outliers_removed ? ' (' + comp.outliers_removed + ' set aside)' : '')]);
+      equationRows.push(['Comp data quality', comp.quality + ' · ' + comp.coverage_pct + '% coverage']);
+    }
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Implied value' }),
-      el('div', { class: 'equation' },
-        el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
-        el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
-        el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
-        el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
-        el('div', null, el('span', { text: 'Category multiple' }), el('b', { class: 'num', text: (row.base_multiple === null || row.base_multiple === undefined ? 'n/a' : String(row.base_multiple) + 'x') })),
-        el('div', null, el('span', { text: 'Tokenized comps behind it' }), el('b', { class: 'num', text: String(row.comp_count || 0) })),
-        el('div', null, el('span', { text: 'Confidence' }), el('b', { class: 'num', text: (row.confidence ? String(row.confidence) + ' / 100' : 'n/a') })),
-        el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
-      ),
+      el('div', { class: 'equation' }, equationRows.map(function (pair) {
+        return el('div', null, el('span', { text: pair[0] }), el('b', { class: 'num', text: pair[1] }));
+      })),
       el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(impliedOf(row, DATA.model)) + (impliedOf(row, DATA.model) === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
@@ -377,7 +525,11 @@
     shell.appendChild(lede());
     shell.appendChild(controls());
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
-    if (state.tab === 'pre-token') shell.appendChild(modelPanel());
+    if (state.tab === 'pre-token') {
+      shell.appendChild(modelPanel());
+      var comps = compPanel();
+      if (comps) shell.appendChild(comps);
+    }
     app.appendChild(shell);
     app.setAttribute('aria-busy', 'false');
     if (!dialog.isConnected) app.appendChild(dialog);
